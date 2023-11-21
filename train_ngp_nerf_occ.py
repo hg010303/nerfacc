@@ -29,7 +29,7 @@ parser.add_argument(
     "--data_root",
     type=str,
     # default=str(pathlib.Path.cwd() / "data/360_v2"),
-    default='/root/dataset2/nerf_synthetic',
+    default=str(pathlib.Path.cwd() / "data/nerf_synthetic"),
     help="the root dir of the dataset",
 )
 parser.add_argument(
@@ -52,7 +52,7 @@ device = "cuda:0"
 set_random_seed(42)
 
 if args.scene in MIPNERF360_UNBOUNDED_SCENES:
-    from datasets.nerf_360_v2 import SubjectLoader
+    from examples.datasets.nerf_360_v2 import SubjectLoader
 
     # training parameters
     max_steps = 20000

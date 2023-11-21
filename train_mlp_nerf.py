@@ -3,7 +3,6 @@ Copyright (c) 2022 Ruilong Li, UC Berkeley.
 """
 
 import argparse
-import math
 import pathlib
 import time
 
@@ -12,11 +11,15 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import tqdm
-from datasets.dnerf_synthetic import SubjectLoader
+from datasets.nerf_synthetic import SubjectLoader
 from lpips import LPIPS
-from radiance_fields.mlp import TNeRFRadianceField
+from radiance_fields.mlp import VanillaNeRFRadianceField
 
-from examples.utils import render_image_with_occgrid, set_random_seed
+from examples.utils import (
+    NERF_SYNTHETIC_SCENES,
+    render_image_with_occgrid,
+    set_random_seed,
+)
 from nerfacc.estimators.occ_grid import OccGridEstimator
 
 device = "cuda:0"
@@ -26,31 +29,27 @@ parser = argparse.ArgumentParser()
 parser.add_argument(
     "--data_root",
     type=str,
-    default=str(pathlib.Path.cwd() / "data/dnerf"),
+    default=str(pathlib.Path.cwd() / "data/nerf_synthetic"),
     help="the root dir of the dataset",
 )
 parser.add_argument(
     "--train_split",
     type=str,
     default="train",
-    choices=["train"],
+    choices=["train", "trainval"],
     help="which train split to use",
+)
+parser.add_argument(
+    "--model_path",
+    type=str,
+    default=None,
+    help="the path of the pretrained model",
 )
 parser.add_argument(
     "--scene",
     type=str,
     default="lego",
-    choices=[
-        # dnerf
-        "bouncingballs",
-        "hellwarrior",
-        "hook",
-        "jumpingjacks",
-        "lego",
-        "mutant",
-        "standup",
-        "trex",
-    ],
+    choices=NERF_SYNTHETIC_SCENES,
     help="which scene to use",
 )
 parser.add_argument(
@@ -61,7 +60,7 @@ parser.add_argument(
 args = parser.parse_args()
 
 # training parameters
-max_steps = 30000
+max_steps = 50000
 init_batch_size = 1024
 target_sample_batch_size = 1 << 16
 # scene parameters
@@ -95,7 +94,7 @@ estimator = OccGridEstimator(
 ).to(device)
 
 # setup the radiance field we want to train.
-radiance_field = TNeRFRadianceField().to(device)
+radiance_field = VanillaNeRFRadianceField().to(device)
 optimizer = torch.optim.Adam(radiance_field.parameters(), lr=5e-4)
 scheduler = torch.optim.lr_scheduler.MultiStepLR(
     optimizer,
@@ -112,6 +111,16 @@ lpips_net = LPIPS(net="vgg").to(device)
 lpips_norm_fn = lambda x: x[None, ...].permute(0, 3, 1, 2) * 2 - 1
 lpips_fn = lambda x, y: lpips_net(lpips_norm_fn(x), lpips_norm_fn(y)).mean()
 
+if args.model_path is not None:
+    checkpoint = torch.load(args.model_path)
+    radiance_field.load_state_dict(checkpoint["radiance_field_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+    estimator.load_state_dict(checkpoint["estimator_state_dict"])
+    step = checkpoint["step"]
+else:
+    step = 0
+
 # training
 tic = time.time()
 for step in range(max_steps + 1):
@@ -124,14 +133,15 @@ for step in range(max_steps + 1):
     render_bkgd = data["color_bkgd"]
     rays = data["rays"]
     pixels = data["pixels"]
-    timestamps = data["timestamps"]
+
+    def occ_eval_fn(x):
+        density = radiance_field.query_density(x)
+        return density * render_step_size
 
     # update occupancy grid
     estimator.update_every_n_steps(
         step=step,
-        occ_eval_fn=lambda x: radiance_field.query_opacity(
-            x, timestamps, render_step_size
-        ),
+        occ_eval_fn=occ_eval_fn,
         occ_thre=1e-2,
     )
 
@@ -144,9 +154,6 @@ for step in range(max_steps + 1):
         near_plane=near_plane,
         render_step_size=render_step_size,
         render_bkgd=render_bkgd,
-        alpha_thre=0.01 if step > 1000 else 0.00,
-        # t-nerf options
-        timestamps=timestamps,
     )
     if n_rendering_samples == 0:
         continue
@@ -179,6 +186,18 @@ for step in range(max_steps + 1):
         )
 
     if step > 0 and step % max_steps == 0:
+        model_save_path = str(pathlib.Path.cwd() / f"mlp_nerf_{step}")
+        torch.save(
+            {
+                "step": step,
+                "radiance_field_state_dict": radiance_field.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "estimator_state_dict": estimator.state_dict(),
+            },
+            model_save_path,
+        )
+
         # evaluation
         radiance_field.eval()
         estimator.eval()
@@ -191,7 +210,6 @@ for step in range(max_steps + 1):
                 render_bkgd = data["color_bkgd"]
                 rays = data["rays"]
                 pixels = data["pixels"]
-                timestamps = data["timestamps"]
 
                 # rendering
                 rgb, acc, depth, _ = render_image_with_occgrid(
@@ -202,11 +220,8 @@ for step in range(max_steps + 1):
                     near_plane=near_plane,
                     render_step_size=render_step_size,
                     render_bkgd=render_bkgd,
-                    alpha_thre=0.01,
                     # test options
                     test_chunk_size=args.test_chunk_size,
-                    # t-nerf options
-                    timestamps=timestamps,
                 )
                 mse = F.mse_loss(rgb, pixels)
                 psnr = -10.0 * torch.log(mse) / np.log(10.0)

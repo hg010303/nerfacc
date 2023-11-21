@@ -150,7 +150,6 @@ class OccGridEstimator(AbstractEstimator):
             >>> sample_locs = rays_o[ray_indices] + t_mid * rays_d[ray_indices]
 
         """
-
         near_planes = torch.full_like(rays_o[..., 0], fill_value=near_plane)
         far_planes = torch.full_like(rays_o[..., 0], fill_value=far_plane)
 
